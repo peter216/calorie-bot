@@ -13,7 +13,7 @@ app = FastAPI()
 # --- config ---
 SECRET = os.environ.get("ESTIMATE_SHARED_SECRET", "")
 LOG_PATH = os.environ.get("ESTIMATE_LOG_PATH", os.path.expanduser("~/calorie-bot/logs/estimates.jsonl"))
-MODEL = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini")
+MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.2")
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 if not OPENAI_API_KEY:
@@ -129,7 +129,7 @@ def estimate(payload: Any = Body(...), x_shared_secret: str = Header(default="")
     }
 
     prompt = f"""
-You estimate calories from a short description and return JSON matching the provided schema.
+You estimate calories from a short description and return JSON matching the provided schema. Use the FoodData Central API, swagger file is in ./fdc_api.json. API key is in environment variable FDC_API_KEY.
 
 Rules:
 - kind=food => kcal is intake (Dietary Energy).
