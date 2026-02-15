@@ -5,3 +5,4 @@ logs/
 data/
 .pre-commit-config.yaml
 icloud-shortcuts
+fda-data-cache.json
