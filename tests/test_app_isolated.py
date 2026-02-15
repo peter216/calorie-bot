@@ -131,6 +131,41 @@ class TestFdcLookupIsolated(unittest.TestCase):
         self.assertIn(cache_key, cache["entries"])
         self.assertEqual(cache["entries"][cache_key]["returncode"], 0)
 
+    def test_default_fdc_query_extracts_food_description(self):
+        self.assertEqual(self.appmod._default_fdc_query("1/2 cup of oat milk"), "oat milk")
+        self.assertEqual(self.appmod._default_fdc_query("bowl of Kellogs raisin bran"), "Kellogs raisin bran")
+
+    def test_run_lookup_planning_failure_uses_food_only_query(self):
+        completed = subprocess.CompletedProcess(
+            args=["python3", "get_fdc_data.py"],
+            returncode=0,
+            stdout="[]",
+            stderr="",
+        )
+
+        with mock.patch.object(self.appmod.client.responses, "create", side_effect=RuntimeError("planner down")):
+            with mock.patch.object(self.appmod.subprocess, "run", return_value=completed) as mock_run:
+                result = self.appmod._run_fdc_lookup("1/2 cup of oat milk", datetime.now(timezone.utc).isoformat())
+
+        self.assertEqual(result["query_plan"]["query"], "oat milk")
+        self.assertIn("query_planning_failed", " ".join(result["backend_errors"]))
+        cmd = mock_run.call_args.args[0]
+        self.assertEqual(cmd[2], "oat milk")
+
+    def test_extract_notices_from_stderr(self):
+        stderr = "\n".join(
+            [
+                "2026-01-01 00:00:00 - WARNING - FDC_NOTICE: page limit reached",
+                "2026-01-01 00:00:01 - WARNING - other warning",
+                "FDC_NOTICE: candidate limit reached",
+            ]
+        )
+        notices = self.appmod._extract_fdc_notices(stderr)
+        stripped = self.appmod._stderr_without_fdc_notices(stderr)
+        self.assertEqual(notices, ["page limit reached", "candidate limit reached"])
+        self.assertIn("other warning", stripped)
+        self.assertNotIn("FDC_NOTICE:", stripped)
+
 
 @unittest.skipIf(not APP_TEST_DEPS_AVAILABLE or TestClient is None, "fastapi/openai test dependencies are not available")
 class TestEstimateEndpointIsolated(unittest.TestCase):
@@ -231,6 +266,46 @@ class TestEstimateEndpointIsolated(unittest.TestCase):
         self.assertEqual(payload["data_source"], "model_fallback")
         self.assertEqual(payload["kcal"], 234)  # rounded to int by backend
         self.assertIn("subprocess_returncode_1", payload["backend_errors"])
+
+    def test_estimate_appends_backend_notices_to_notes(self):
+        mock_lookup = {
+            "subprocess_call": "python get_fdc_data.py oat milk --search-category Foundation",
+            "stdout": '[{"description":"Oat milk","kcal":48.3}]',
+            "stderr": "2026-01-01 - WARNING - FDC_NOTICE: search results truncated by page limit",
+            "stderr_for_errors": "",
+            "returncode": 0,
+            "data": [{"description": "Oat milk", "servingSize": None, "servingSizeUnit": None, "householdServingFullText": None, "kcal": 48.3}],
+            "query_plan": {"query": "oat milk", "search_category": "Foundation", "brand_owner": None},
+            "from_cache": False,
+            "backend_errors": [],
+            "fdc_notices": ["search results truncated by page limit"],
+        }
+        model_payload = {
+            "kind": "food",
+            "kcal": 24,
+            "start": "2026-02-15T13:02:00+00:00",
+            "end": "2026-02-15T13:02:00+00:00",
+            "notes": "Used backend candidate.",
+            "data_source": "fdc_script",
+            "backend_errors": [],
+        }
+
+        with mock.patch.object(self.appmod, "_run_fdc_lookup", return_value=mock_lookup):
+            with mock.patch.object(
+                self.appmod.client.responses,
+                "create",
+                return_value=DummyOpenAIResponse(model_payload),
+            ):
+                response = self.client.post(
+                    "/estimate",
+                    headers={"X-Shared-Secret": "test-shared-secret"},
+                    json={"text": "1/2 cup of oat milk"},
+                )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertIn("Backend warnings:", payload["notes"])
+        self.assertIn("page limit", payload["notes"])
 
 
 if __name__ == "__main__":

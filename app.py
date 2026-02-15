@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import shlex
 import subprocess
 import sys
@@ -17,12 +18,13 @@ app = FastAPI()
 # --- config ---
 SECRET = os.environ.get("ESTIMATE_SHARED_SECRET", "")
 LOG_PATH = os.environ.get("ESTIMATE_LOG_PATH", os.path.expanduser("~/calorie-bot/logs/estimates.jsonl"))
-MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.2")
+MODEL = os.environ.get("OPENAI_MODEL", "gpt-5-mini")
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 FDC_SCRIPT_PATH = os.path.join(APP_DIR, "get_fdc_data.py")
 FDC_CACHE_PATH = os.environ.get("FDC_CACHE_PATH", os.path.join(APP_DIR, "fda-data-cache.json"))
 FDC_CACHE_TTL_SECONDS = 90 * 24 * 60 * 60
-FDC_SUBPROCESS_TIMEOUT_SECONDS = int(os.environ.get("FDC_SUBPROCESS_TIMEOUT_SECONDS", "45"))
+FDC_SUBPROCESS_TIMEOUT_SECONDS = int(os.environ.get("FDC_SUBPROCESS_TIMEOUT_SECONDS", "12"))
+FDC_NOTICE_PREFIX = "FDC_NOTICE:"
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 if not OPENAI_API_KEY:
@@ -151,11 +153,108 @@ def _unique_errors(errors: list[str]) -> list[str]:
     return output
 
 
+def _extract_fdc_notices(stderr_text: str) -> list[str]:
+    notices: list[str] = []
+    if not stderr_text:
+        return notices
+    for raw_line in stderr_text.splitlines():
+        marker = raw_line.find(FDC_NOTICE_PREFIX)
+        if marker < 0:
+            continue
+        message = raw_line[marker + len(FDC_NOTICE_PREFIX):].strip()
+        if message:
+            notices.append(message)
+    return _unique_errors(notices)
+
+
+def _stderr_without_fdc_notices(stderr_text: str) -> str:
+    if not stderr_text:
+        return ""
+    lines = []
+    for line in stderr_text.splitlines():
+        if FDC_NOTICE_PREFIX not in line:
+            lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def _append_notices_to_notes(notes: str, notices: list[str]) -> str:
+    if not notices:
+        return notes
+    suffix = "Backend warnings: " + "; ".join(notices)
+    base = (notes or "").strip()
+    if not base:
+        return suffix
+    if suffix in base:
+        return base
+    return f"{base} {suffix}"
+
+
+_UNIT_WORDS = {
+    "cup", "cups", "tbsp", "tablespoon", "tablespoons", "tsp", "teaspoon", "teaspoons",
+    "oz", "ounce", "ounces", "fl", "floz", "ml", "l", "liter", "liters", "litre", "litres",
+    "g", "gram", "grams", "kg", "lb", "lbs", "pound", "pounds",
+    "serving", "servings", "slice", "slices", "piece", "pieces",
+    "bowl", "bowls", "plate", "plates", "can", "cans", "bottle", "bottles",
+    "packet", "packets",
+}
+_CONTAINER_WORDS = {"bowl", "bowls", "plate", "plates", "serving", "servings"}
+
+
+def _is_number_token(token: str) -> bool:
+    return bool(re.fullmatch(r"\d+(?:\.\d+)?|\d+\s*/\s*\d+", token))
+
+
+def _extract_food_tokens(text: str) -> list[str]:
+    normalized = " ".join((text or "").strip().split())
+    if not normalized:
+        return []
+
+    raw_tokens = []
+    for token in normalized.replace('"', " ").replace("'", " ").split():
+        cleaned = token.strip(".,;:()[]{}").lstrip("+")
+        if cleaned:
+            raw_tokens.append(cleaned)
+
+    tokens = raw_tokens
+    while tokens:
+        first = tokens[0].lower()
+        second = tokens[1].lower() if len(tokens) > 1 else ""
+        if _is_number_token(first):
+            tokens = tokens[1:]
+            continue
+        if first in {"a", "an", "the"} and len(tokens) > 1:
+            tokens = tokens[1:]
+            continue
+        if first in {"half", "quarter"} and (second in _UNIT_WORDS or second == "of"):
+            tokens = tokens[1:]
+            continue
+        if first in _CONTAINER_WORDS and second == "of":
+            tokens = tokens[2:]
+            continue
+        if first in _UNIT_WORDS:
+            tokens = tokens[1:]
+            if tokens and tokens[0].lower() == "of":
+                tokens = tokens[1:]
+            continue
+        if first == "of":
+            tokens = tokens[1:]
+            continue
+        break
+
+    return tokens
+
+
+def _sanitize_fdc_query(text: str) -> str:
+    tokens = _extract_food_tokens(text)
+    if tokens:
+        return " ".join(tokens[:8])
+    fallback = " ".join((text or "").replace('"', " ").replace("'", " ").split()).strip()
+    return fallback
+
+
 def _default_fdc_query(text: str) -> str:
-    tokens = [t for t in text.strip().split() if t]
-    if not tokens:
-        return text
-    return " ".join(f"+{token.strip('\"')}" for token in tokens[:8])
+    query = _sanitize_fdc_query(text)
+    return query if query else text
 
 
 def _plan_fdc_query(text: str, now: str) -> tuple[dict, list[str]]:
@@ -180,10 +279,11 @@ You produce a backend query plan for FoodData Central script calls.
 Return JSON matching schema exactly.
 
 Guidance:
+- Use exactly one food item for each query plan.
+- Remove portions/amounts/units from the query (e.g., "1/2 cup of oat milk" -> "oat milk").
 - Decide whether to use Foundation or Branded search.
 - If query appears brand-specific (unusual non-food token like brand name), choose Branded.
-- For multi-word food phrases, format query to reduce false positives:
-  use quoted phrase (e.g., "raisin bran") or plus tokens (e.g., +wheat +bread).
+- Return plain text food terms only. Do not use quotes or plus-prefixed tokens.
 - Keep query concise and focused on food terms.
 - For exercise-like input, still produce the best food-style query from text.
 
@@ -198,7 +298,7 @@ text={text}
             text={"format": {"type": "json_schema", **schema}},
         )
         plan = json.loads(r.output_text)
-        query = (plan.get("query") or "").strip()
+        query = _sanitize_fdc_query((plan.get("query") or "").strip())
         search_category = plan.get("search_category")
         brand_owner = plan.get("brand_owner")
         if not query:
@@ -243,15 +343,21 @@ def _run_fdc_lookup(text: str, now: str) -> dict:
     key = _cache_key(query, search_category, brand_owner)
     cache_entry = cache.get("entries", {}).get(key)
     if isinstance(cache_entry, dict):
+        cached_stderr = cache_entry.get("stderr", "")
+        cached_notices = cache_entry.get("fdc_notices")
+        if not isinstance(cached_notices, list):
+            cached_notices = _extract_fdc_notices(cached_stderr)
         return {
             "subprocess_call": cmd_str,
             "stdout": cache_entry.get("stdout", ""),
-            "stderr": cache_entry.get("stderr", ""),
+            "stderr": cached_stderr,
+            "stderr_for_errors": _stderr_without_fdc_notices(cached_stderr),
             "returncode": cache_entry.get("returncode", 0),
             "data": cache_entry.get("data", []),
             "query_plan": plan,
             "from_cache": True,
             "backend_errors": backend_errors,
+            "fdc_notices": cached_notices,
         }
 
     try:
@@ -278,6 +384,8 @@ def _run_fdc_lookup(text: str, now: str) -> dict:
 
     stdout = (proc.stdout or "").strip()
     stderr = (proc.stderr or "").strip()
+    fdc_notices = _extract_fdc_notices(stderr)
+    stderr_for_errors = _stderr_without_fdc_notices(stderr)
     returncode = proc.returncode
     parsed_data = []
 
@@ -302,6 +410,7 @@ def _run_fdc_lookup(text: str, now: str) -> dict:
             "returncode": returncode,
             "data": parsed_data,
             "query_plan": plan,
+            "fdc_notices": fdc_notices,
         }
         try:
             _save_fdc_cache(cache)
@@ -312,11 +421,13 @@ def _run_fdc_lookup(text: str, now: str) -> dict:
         "subprocess_call": cmd_str,
         "stdout": stdout,
         "stderr": stderr,
+        "stderr_for_errors": stderr_for_errors,
         "returncode": returncode,
         "data": parsed_data,
         "query_plan": plan,
         "from_cache": False,
         "backend_errors": backend_errors,
+        "fdc_notices": fdc_notices,
     }
 
 # --- routes ---
@@ -358,9 +469,11 @@ def estimate(payload: Any = Body(...), x_shared_secret: str = Header(default="")
 
     fdc_lookup = _run_fdc_lookup(text, now)
     fdc_candidates = fdc_lookup.get("data") or []
+    fdc_notices = list(fdc_lookup.get("fdc_notices") or [])
     backend_errors = list(fdc_lookup.get("backend_errors") or [])
-    if fdc_lookup.get("stderr"):
-        backend_errors.append(f"subprocess_stderr: {fdc_lookup['stderr']}")
+    stderr_for_errors = fdc_lookup.get("stderr_for_errors")
+    if stderr_for_errors:
+        backend_errors.append(f"subprocess_stderr: {stderr_for_errors}")
     backend_errors = _unique_errors(backend_errors)
 
     schema = {
@@ -399,8 +512,10 @@ Rules:
 - Use servingSize / servingSizeUnit / householdServingFullText and kcal to scale amount when quantity is present.
 - If no backend food candidates: set data_source=model_fallback.
 - If backend food candidates are used: set data_source=fdc_script.
+- Include backend_warnings in notes when they are provided.
 - Put assumptions + uncertainty in notes.
 backend_errors={json.dumps(backend_errors)}
+backend_warnings={json.dumps(fdc_notices)}
 backend_query_plan={json.dumps(fdc_lookup.get("query_plan"))}
 backend_food_candidates={json.dumps(fdc_candidates)}
 now={now}
@@ -416,6 +531,7 @@ text={text}
     data = json.loads(r.output_text)
     uses_fdc = data.get("kind") == "food" and bool(fdc_candidates)
     data["data_source"] = "fdc_script" if uses_fdc else "model_fallback"
+    data["notes"] = _append_notices_to_notes(data.get("notes", ""), fdc_notices)
     data["backend_errors"] = backend_errors
 
     try:
