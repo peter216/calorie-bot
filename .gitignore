@@ -2,3 +2,6 @@ uv_*
 .uv
 **/__pycache__/
 logs/
+data/
+.pre-commit-config.yaml
+icloud-shortcuts

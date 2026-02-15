@@ -123,13 +123,16 @@ def estimate(payload: Any = Body(...), x_shared_secret: str = Header(default="")
                 "start": {"type": "string"},
                 "end": {"type": "string"},
                 "notes": {"type": "string"},
+                "fdc_api_query": {"type": "string"},
+                "fdc_api_response_code": {"type": "integer"},
+                "fdc_api_response": {"type": "object"},
             },
             "required": ["kind", "kcal", "start", "end", "notes"],
         },
     }
 
     prompt = f"""
-You estimate calories from a short description and return JSON matching the provided schema. Use the FoodData Central API, swagger file is in ./fdc_api.json. API key is in environment variable FDC_API_KEY.
+You estimate calories from a short description and return JSON matching the provided schema. Use the FoodData Central API, by running the script get_fdc_data.py with the food description as the argument, to find calorie data for food items. For exercises, use your training data to make an estimate. Always include your assumptions and uncertainty in the notes field.
 
 Rules:
 - kind=food => kcal is intake (Dietary Energy).
@@ -139,6 +142,19 @@ Rules:
 - Put assumptions + uncertainty in notes.
 now={now}
 text={text}
+
+```bash
+# Example script queries and responses:
+
+./get_fdc_data.py '+wheat +bread'
+[{"description": "Bread, whole-wheat, commercially prepared", "servingSize": 32.1, "servingSizeUnit": "g", "householdServingFullText": "1 slice", "kcal": 81.53}]
+
+# In this case you would select the option with description "NILLA WAFERS" since it is the best match and calculate based on the number of wafers/cookies if given.
+
+./get_fdc_data.py "+nilla +wafers" --search-category "Branded" --brand-owner "nabisco" | jq -c
+[{"description":"NILLA WAFERS","servingSize":30.0,"servingSizeUnit":"g","householdServingFullText":"8 wafers","kcal":467},{"description":"WAFERS","servingSize":30.0,"servingSizeUnit":"GRM","householdServingFullText":"8 wafers","kcal":467},{"description":"MINI WAFERS","servingSize":28.0,"servingSizeUnit":"GRM","householdServingFullText":"1 pack","kcal":464},{"description":"LEMON WAFERS, LEMON","servingSize":30.0,"servingSizeUnit":"g","householdServingFullText":"8 wafers","kcal":467},{"description":"REDUCED FAT WAFERS","servingSize":29.0,"servingSizeUnit":"MG","householdServingFullText":"8 WAFERS","kcal":414}]
+```
+
 """
 
     r = client.responses.create(
