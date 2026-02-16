@@ -17,14 +17,16 @@ app = FastAPI()
 
 # --- config ---
 SECRET = os.environ.get("ESTIMATE_SHARED_SECRET", "")
-LOG_PATH = os.environ.get("ESTIMATE_LOG_PATH", os.path.expanduser("~/calorie-bot/logs/estimates.jsonl"))
-MODEL = os.environ.get("OPENAI_MODEL", "gpt-5-mini")
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
+LOG_DIR = os.path.join(APP_DIR, "logs")
+LOG_PATH = os.environ.get("ESTIMATE_LOG_PATH", os.path.join(LOG_DIR, "estimates.jsonl"))
+MODEL = os.environ.get("OPENAI_MODEL", "gpt-5-mini")
 FDC_SCRIPT_PATH = os.path.join(APP_DIR, "get_fdc_data.py")
 FDC_CACHE_PATH = os.environ.get("FDC_CACHE_PATH", os.path.join(APP_DIR, "fda-data-cache.json"))
 FDC_CACHE_TTL_SECONDS = 90 * 24 * 60 * 60
 FDC_SUBPROCESS_TIMEOUT_SECONDS = int(os.environ.get("FDC_SUBPROCESS_TIMEOUT_SECONDS", "12"))
 FDC_NOTICE_PREFIX = "FDC_NOTICE:"
+FDC_SCRIPT_LOG_PATH = os.environ.get("FDC_LOGFILE_PATH", os.path.join(LOG_DIR, "get_fdc_data.log"))
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 if not OPENAI_API_KEY:
@@ -198,6 +200,10 @@ _UNIT_WORDS = {
     "packet", "packets",
 }
 _CONTAINER_WORDS = {"bowl", "bowls", "plate", "plates", "serving", "servings"}
+_GENERIC_SEARCH_TOKENS = {
+    "cereal", "food", "foods", "drink", "drinks", "beverage", "beverages",
+    "snack", "snacks", "meal", "meals", "item", "items",
+}
 
 
 def _is_number_token(token: str) -> bool:
@@ -244,16 +250,63 @@ def _extract_food_tokens(text: str) -> list[str]:
     return tokens
 
 
+def _prune_generic_tokens(tokens: list[str]) -> list[str]:
+    if len(tokens) <= 1:
+        return tokens
+    filtered = [token for token in tokens if token.lower() not in _GENERIC_SEARCH_TOKENS]
+    if len(filtered) >= 2:
+        return filtered
+    return tokens
+
+
+def _quoted_query(tokens: list[str]) -> str:
+    if not tokens:
+        return ""
+    if len(tokens) == 1:
+        return tokens[0]
+    return f"\"{' '.join(tokens)}\""
+
+
+def _plus_query(tokens: list[str]) -> str:
+    if not tokens:
+        return ""
+    if len(tokens) == 1:
+        return tokens[0]
+    return " ".join(f"+{token}" for token in tokens)
+
+
 def _sanitize_fdc_query(text: str) -> str:
-    tokens = _extract_food_tokens(text)
+    tokens = _prune_generic_tokens(_extract_food_tokens(text))
     if tokens:
         return " ".join(tokens[:8])
     fallback = " ".join((text or "").replace('"', " ").replace("'", " ").split()).strip()
     return fallback
 
 
+def _normalize_planned_query(raw_query: str) -> str:
+    query = (raw_query or "").strip()
+    if not query:
+        return query
+
+    plus_tokens = []
+    for token in query.split():
+        if not token.startswith("+"):
+            continue
+        cleaned = token.lstrip("+").strip(".,;:()[]{}\"'")
+        if cleaned:
+            plus_tokens.append(cleaned)
+    plus_tokens = _prune_generic_tokens(plus_tokens)[:8]
+    if plus_tokens:
+        return _plus_query(plus_tokens)
+
+    text_query = _sanitize_fdc_query(query)
+    if not text_query:
+        return text_query
+    return _quoted_query(text_query.split())
+
+
 def _default_fdc_query(text: str) -> str:
-    query = _sanitize_fdc_query(text)
+    query = _normalize_planned_query(text)
     return query if query else text
 
 
@@ -281,9 +334,11 @@ Return JSON matching schema exactly.
 Guidance:
 - Use exactly one food item for each query plan.
 - Remove portions/amounts/units from the query (e.g., "1/2 cup of oat milk" -> "oat milk").
+- Prefer narrow queries to reduce false positives.
+- For multi-word foods, prefer exact phrase quotes (e.g., "raisin bran") or +required tokens (e.g., +raisin +bran).
+- Avoid generic modifiers that broaden results when not needed (e.g., "cereal", "food", "drink").
 - Decide whether to use Foundation or Branded search.
 - If query appears brand-specific (unusual non-food token like brand name), choose Branded.
-- Return plain text food terms only. Do not use quotes or plus-prefixed tokens.
 - Keep query concise and focused on food terms.
 - For exercise-like input, still produce the best food-style query from text.
 
@@ -298,7 +353,7 @@ text={text}
             text={"format": {"type": "json_schema", **schema}},
         )
         plan = json.loads(r.output_text)
-        query = _sanitize_fdc_query((plan.get("query") or "").strip())
+        query = _normalize_planned_query((plan.get("query") or "").strip())
         search_category = plan.get("search_category")
         brand_owner = plan.get("brand_owner")
         if not query:
@@ -361,12 +416,15 @@ def _run_fdc_lookup(text: str, now: str) -> dict:
         }
 
     try:
+        env = os.environ.copy()
+        env.setdefault("FDC_LOGFILE_PATH", FDC_SCRIPT_LOG_PATH)
         proc = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
             timeout=FDC_SUBPROCESS_TIMEOUT_SECONDS,
             cwd=APP_DIR,
+            env=env,
             check=False,
         )
     except Exception as exc:
@@ -472,7 +530,7 @@ def estimate(payload: Any = Body(...), x_shared_secret: str = Header(default="")
     fdc_notices = list(fdc_lookup.get("fdc_notices") or [])
     backend_errors = list(fdc_lookup.get("backend_errors") or [])
     stderr_for_errors = fdc_lookup.get("stderr_for_errors")
-    if stderr_for_errors:
+    if fdc_lookup.get("returncode", 0) != 0 and stderr_for_errors:
         backend_errors.append(f"subprocess_stderr: {stderr_for_errors}")
     backend_errors = _unique_errors(backend_errors)
 

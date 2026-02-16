@@ -10,16 +10,18 @@ import time
 import urllib.parse
 
 
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+LOG_DIR = os.path.join(APP_DIR, "logs")
 SEARCH_URL = "https://api.nal.usda.gov/fdc/v1/foods/search"
 DETAIL_URL_TEMPLATE = "https://api.nal.usda.gov/fdc/v1/food/{fdc_id}"
 NOTICE_PREFIX = "FDC_NOTICE:"
-REQUEST_TIMEOUT_SECONDS = float(os.getenv("FDC_REQUEST_TIMEOUT_SECONDS", "3"))
+REQUEST_TIMEOUT_SECONDS = float(os.getenv("FDC_REQUEST_TIMEOUT_SECONDS", "30"))
 SEARCH_RETRIES = int(os.getenv("FDC_SEARCH_RETRIES", "2"))
 PAGE_SIZE = max(1, int(os.getenv("FDC_PAGE_SIZE", "50")))
 MAX_SEARCH_PAGES = max(1, int(os.getenv("FDC_MAX_SEARCH_PAGES", "1")))
 MAX_SEARCH_RESULTS = int(os.getenv("FDC_MAX_SEARCH_RESULTS", "16"))
 MAX_DETAIL_LOOKUPS = int(os.getenv("FDC_MAX_DETAIL_LOOKUPS", "2"))
-LOGFILE_PATH = os.getenv("FDC_LOGFILE_PATH", "./logs/get_fdc_data.log")
+LOGFILE_PATH = os.getenv("FDC_LOGFILE_PATH", os.path.join(LOG_DIR, "get_fdc_data.log"))
 
 
 def extract_kcal_per_100g(food):
@@ -73,10 +75,44 @@ _UNIT_WORDS = {
     "packet", "packets",
 }
 _CONTAINER_WORDS = {"bowl", "bowls", "plate", "plates", "serving", "servings"}
+_GENERIC_SEARCH_TOKENS = {
+    "cereal", "food", "foods", "drink", "drinks", "beverage", "beverages",
+    "snack", "snacks", "meal", "meals", "item", "items",
+}
 
 
 def _is_number_token(token):
     return bool(re.fullmatch(r"\d+(?:\.\d+)?|\d+\s*/\s*\d+", token))
+
+
+def _prune_generic_tokens(tokens):
+    if len(tokens) <= 1:
+        return tokens
+    filtered = [token for token in tokens if token.lower() not in _GENERIC_SEARCH_TOKENS]
+    if len(filtered) >= 2:
+        return filtered
+    return tokens
+
+
+def _quoted_query(tokens):
+    if not tokens:
+        return ""
+    if len(tokens) == 1:
+        return tokens[0]
+    return f"\"{' '.join(tokens)}\""
+
+
+def _plus_query(tokens):
+    if not tokens:
+        return ""
+    if len(tokens) == 1:
+        return tokens[0]
+    return " ".join(f"+{token}" for token in tokens)
+
+
+def _append_candidate(candidates, candidate):
+    if candidate and candidate not in candidates:
+        candidates.append(candidate)
 
 
 def extract_food_query(text):
@@ -116,6 +152,7 @@ def extract_food_query(text):
             continue
         break
 
+    tokens = _prune_generic_tokens(tokens)
     if tokens:
         return " ".join(tokens[:8])
     return normalized
@@ -164,7 +201,13 @@ def build_search_query_candidates(query):
     food_query = extract_food_query(query)
     if not food_query:
         return []
-    return [food_query]
+    tokens = [token for token in food_query.split() if token]
+    candidates = []
+    if len(tokens) >= 2:
+        _append_candidate(candidates, _quoted_query(tokens))
+        _append_candidate(candidates, _plus_query(tokens))
+    _append_candidate(candidates, " ".join(tokens))
+    return candidates
 
 
 def emit_notice(logger, message):
@@ -240,98 +283,112 @@ def search_foods(session, food_description, search_category, brand_owner, fdc_ap
     if not query_candidates:
         raise ValueError("food_description is empty")
 
-    last_exc = None
-    for idx, candidate in enumerate(query_candidates, start=1):
-        search_params = {
-            "api_key": fdc_api_key,
-            "query": candidate,
-            "dataType": "Branded" if brand_owner else search_category,
-            "pageSize": PAGE_SIZE,
-            "pageNumber": 1,
-            "sortBy": "dataType.keyword",
-            "sortOrder": "asc",
-        }
-        if brand_owner:
-            search_params["brandOwner"] = brand_owner
+    def _search_with_category(category):
+        last_exc = None
+        for idx, candidate in enumerate(query_candidates, start=1):
+            search_params = {
+                "api_key": fdc_api_key,
+                "query": candidate,
+                "dataType": category,
+                "pageSize": PAGE_SIZE,
+                "pageNumber": 1,
+                "sortBy": "dataType.keyword",
+                "sortOrder": "asc",
+            }
+            if brand_owner:
+                search_params["brandOwner"] = brand_owner
 
-        try:
-            first_response_json = get_json_with_retries(
-                session,
-                SEARCH_URL,
-                headers,
-                logger,
-                retries=SEARCH_RETRIES,
-                timeout=REQUEST_TIMEOUT_SECONDS,
-                params=search_params,
-            )
-        except requests.HTTPError as exc:
-            last_exc = exc
-            status = exc.response.status_code if exc.response is not None else None
-            error_body = ""
-            if exc.response is not None and exc.response.text:
-                error_body = " ".join(exc.response.text.strip().split())[:160]
-            logger.warning(
-                "Search failed for query candidate %r (status=%s, candidate %s/%s)%s",
-                candidate,
-                status,
-                idx,
-                len(query_candidates),
-                f" body={error_body!r}" if error_body else "",
-            )
-            if status in {400, 500} and idx < len(query_candidates):
-                continue
-            raise
+            try:
+                first_response_json = get_json_with_retries(
+                    session,
+                    SEARCH_URL,
+                    headers,
+                    logger,
+                    retries=SEARCH_RETRIES,
+                    timeout=REQUEST_TIMEOUT_SECONDS,
+                    params=search_params,
+                )
+            except requests.HTTPError as exc:
+                last_exc = exc
+                status = exc.response.status_code if exc.response is not None else None
+                error_body = ""
+                if exc.response is not None and exc.response.text:
+                    error_body = " ".join(exc.response.text.strip().split())[:160]
+                logger.warning(
+                    "Search failed for query candidate %r (status=%s, candidate %s/%s)%s",
+                    candidate,
+                    status,
+                    idx,
+                    len(query_candidates),
+                    f" body={error_body!r}" if error_body else "",
+                )
+                if status in {400, 500} and idx < len(query_candidates):
+                    continue
+                raise
 
-        total_pages = int(first_response_json.get("totalPages") or 1)
-        total_hits = first_response_json.get("totalHits")
-        pages_to_fetch = min(total_pages, MAX_SEARCH_PAGES)
-        foods = first_response_json.get("foods", []) or []
+            total_pages = int(first_response_json.get("totalPages") or 1)
+            total_hits = first_response_json.get("totalHits")
+            pages_to_fetch = min(total_pages, MAX_SEARCH_PAGES)
+            foods = first_response_json.get("foods", []) or []
 
-        if total_pages > MAX_SEARCH_PAGES:
-            emit_notice(
-                logger,
-                (
-                    f"search results truncated by page limit: total_pages={total_pages}, "
-                    f"read_pages={pages_to_fetch}, query={candidate!r}"
-                ),
-            )
+            if total_pages > MAX_SEARCH_PAGES:
+                emit_notice(
+                    logger,
+                    (
+                        f"search results truncated by page limit: total_pages={total_pages}, "
+                        f"read_pages={pages_to_fetch}, query={candidate!r}"
+                    ),
+                )
 
-        for page in range(2, pages_to_fetch + 1):
-            search_params["pageNumber"] = page
-            response_json = get_json_with_retries(
-                session,
-                SEARCH_URL,
-                headers,
-                logger,
-                retries=SEARCH_RETRIES,
-                timeout=REQUEST_TIMEOUT_SECONDS,
-                params=search_params,
-            )
-            foods.extend(response_json.get("foods", []) or [])
+            for page in range(2, pages_to_fetch + 1):
+                search_params["pageNumber"] = page
+                response_json = get_json_with_retries(
+                    session,
+                    SEARCH_URL,
+                    headers,
+                    logger,
+                    retries=SEARCH_RETRIES,
+                    timeout=REQUEST_TIMEOUT_SECONDS,
+                    params=search_params,
+                )
+                foods.extend(response_json.get("foods", []) or [])
 
-        if len(foods) > MAX_SEARCH_RESULTS:
-            emit_notice(
-                logger,
-                (
-                    f"search results truncated by candidate limit: total_candidates={len(foods)}, "
-                    f"returned_candidates={MAX_SEARCH_RESULTS}, query={candidate!r}"
-                ),
-            )
+            if len(foods) > MAX_SEARCH_RESULTS:
+                emit_notice(
+                    logger,
+                    (
+                        f"search results truncated by candidate limit: total_candidates={len(foods)}, "
+                        f"returned_candidates={MAX_SEARCH_RESULTS}, query={candidate!r}"
+                    ),
+                )
 
-        if isinstance(total_hits, int) and total_hits > len(foods):
-            emit_notice(
-                logger,
-                (
-                    f"not all available matches were read: total_hits={total_hits}, "
-                    f"retrieved_candidates={len(foods)}, query={candidate!r}"
-                ),
-            )
+            if isinstance(total_hits, int) and total_hits > len(foods):
+                emit_notice(
+                    logger,
+                    (
+                        f"not all available matches were read: total_hits={total_hits}, "
+                        f"retrieved_candidates={len(foods)}, query={candidate!r}"
+                    ),
+                )
 
-        foods = foods[:MAX_SEARCH_RESULTS]
+            foods = foods[:MAX_SEARCH_RESULTS]
+            if foods:
+                if candidate != food_description:
+                    logger.info("Search succeeded with fallback query candidate %r", candidate)
+                return foods, last_exc
 
-        if candidate != food_description:
-            logger.info("Search succeeded with fallback query candidate %r", candidate)
+        return [], last_exc
+
+    initial_category = "Branded" if brand_owner else search_category
+    foods, last_exc = _search_with_category(initial_category)
+    if foods:
         return foods
+
+    if not brand_owner and initial_category == "Foundation":
+        emit_notice(logger, "No Foundation matches returned; retrying with Branded search category.")
+        foods, last_exc = _search_with_category("Branded")
+        if foods:
+            return foods
 
     if last_exc:
         raise last_exc

@@ -132,8 +132,10 @@ class TestFdcLookupIsolated(unittest.TestCase):
         self.assertEqual(cache["entries"][cache_key]["returncode"], 0)
 
     def test_default_fdc_query_extracts_food_description(self):
-        self.assertEqual(self.appmod._default_fdc_query("1/2 cup of oat milk"), "oat milk")
-        self.assertEqual(self.appmod._default_fdc_query("bowl of Kellogs raisin bran"), "Kellogs raisin bran")
+        self.assertEqual(self.appmod._default_fdc_query("1/2 cup of oat milk"), '"oat milk"')
+        self.assertEqual(self.appmod._default_fdc_query("bowl of Kellogs raisin bran"), '"Kellogs raisin bran"')
+        self.assertEqual(self.appmod._default_fdc_query("raisin bran cereal"), '"raisin bran"')
+        self.assertEqual(self.appmod._normalize_planned_query("+raisin +bran +cereal"), "+raisin +bran")
 
     def test_run_lookup_planning_failure_uses_food_only_query(self):
         completed = subprocess.CompletedProcess(
@@ -147,10 +149,10 @@ class TestFdcLookupIsolated(unittest.TestCase):
             with mock.patch.object(self.appmod.subprocess, "run", return_value=completed) as mock_run:
                 result = self.appmod._run_fdc_lookup("1/2 cup of oat milk", datetime.now(timezone.utc).isoformat())
 
-        self.assertEqual(result["query_plan"]["query"], "oat milk")
+        self.assertEqual(result["query_plan"]["query"], '"oat milk"')
         self.assertIn("query_planning_failed", " ".join(result["backend_errors"]))
         cmd = mock_run.call_args.args[0]
-        self.assertEqual(cmd[2], "oat milk")
+        self.assertEqual(cmd[2], '"oat milk"')
 
     def test_extract_notices_from_stderr(self):
         stderr = "\n".join(
@@ -306,6 +308,45 @@ class TestEstimateEndpointIsolated(unittest.TestCase):
         payload = response.json()
         self.assertIn("Backend warnings:", payload["notes"])
         self.assertIn("page limit", payload["notes"])
+
+    def test_estimate_does_not_treat_info_stderr_as_backend_error_on_success(self):
+        mock_lookup = {
+            "subprocess_call": "python get_fdc_data.py '\"raisin bran\"' --search-category Foundation",
+            "stdout": "[]",
+            "stderr": "2026-02-15 18:54:31,277 - INFO - Starting FDC data retrieval for description='\"raisin bran\"'",
+            "stderr_for_errors": "2026-02-15 18:54:31,277 - INFO - Starting FDC data retrieval for description='\"raisin bran\"'",
+            "returncode": 0,
+            "data": [],
+            "query_plan": {"query": '"raisin bran"', "search_category": "Foundation", "brand_owner": None},
+            "from_cache": False,
+            "backend_errors": [],
+            "fdc_notices": [],
+        }
+        model_payload = {
+            "kind": "food",
+            "kcal": 320,
+            "start": "2026-02-15T13:03:00+00:00",
+            "end": "2026-02-15T13:03:00+00:00",
+            "notes": "Fallback estimate.",
+            "data_source": "model_fallback",
+            "backend_errors": [],
+        }
+
+        with mock.patch.object(self.appmod, "_run_fdc_lookup", return_value=mock_lookup):
+            with mock.patch.object(
+                self.appmod.client.responses,
+                "create",
+                return_value=DummyOpenAIResponse(model_payload),
+            ):
+                response = self.client.post(
+                    "/estimate",
+                    headers={"X-Shared-Secret": "test-shared-secret"},
+                    json={"text": "bowl of raisin bran"},
+                )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["backend_errors"], [])
 
 
 if __name__ == "__main__":

@@ -18,11 +18,15 @@ fdc = importlib.import_module("get_fdc_data")
 class TestQueryNormalization(unittest.TestCase):
     def test_build_candidates_strips_wrapping_quotes(self):
         candidates = fdc.build_search_query_candidates('"oat milk"')
-        self.assertEqual(candidates, ["oat milk"])
+        self.assertEqual(candidates, ['"oat milk"', "+oat +milk", "oat milk"])
 
     def test_build_candidates_removes_portion_and_units(self):
         candidates = fdc.build_search_query_candidates("1/2 cup of oat milk")
-        self.assertEqual(candidates, ["oat milk"])
+        self.assertEqual(candidates, ['"oat milk"', "+oat +milk", "oat milk"])
+
+    def test_build_candidates_removes_generic_cereal_modifier(self):
+        candidates = fdc.build_search_query_candidates("raisin bran cereal")
+        self.assertEqual(candidates, ['"raisin bran"', "+raisin +bran", "raisin bran"])
 
     def test_redact_url_hides_api_key(self):
         raw_url = "https://example.test/search?api_key=SECRET&query=oat+milk"
@@ -63,7 +67,7 @@ class TestSearchFallback(unittest.TestCase):
         self.assertEqual(foods[0]["description"], "Oat milk")
         self.assertEqual(mocked_get.call_count, 1)
         first_query = mocked_get.call_args_list[0].kwargs["params"]["query"]
-        self.assertEqual(first_query, "oat milk")
+        self.assertEqual(first_query, '"oat milk"')
 
     def test_search_foods_respects_max_pages_and_result_limit(self):
         session = mock.Mock()
@@ -95,6 +99,58 @@ class TestSearchFallback(unittest.TestCase):
         self.assertEqual(mocked_get.call_count, 2)
         self.assertEqual([f["description"] for f in foods], ["A", "B"])
         self.assertGreaterEqual(mocked_notice.call_count, 2)
+
+    def test_search_foods_falls_back_to_next_query_candidate_when_first_empty(self):
+        session = mock.Mock()
+        with mock.patch.object(fdc, "get_json_with_retries") as mocked_get:
+            mocked_get.side_effect = [
+                {"totalPages": 1, "foods": []},
+                {"totalPages": 1, "foods": [{"description": "Raisin Bran Result"}]},
+            ]
+
+            foods = fdc.search_foods(
+                session=session,
+                food_description="raisin bran cereal",
+                search_category="Foundation",
+                brand_owner=None,
+                fdc_api_key="SECRET",
+                headers={"Accept": "application/json"},
+                logger=self.logger,
+            )
+
+        self.assertEqual([f["description"] for f in foods], ["Raisin Bran Result"])
+        self.assertEqual(mocked_get.call_count, 2)
+        first_query = mocked_get.call_args_list[0].kwargs["params"]["query"]
+        second_query = mocked_get.call_args_list[1].kwargs["params"]["query"]
+        self.assertEqual(first_query, '"raisin bran"')
+        self.assertEqual(second_query, "+raisin +bran")
+
+    def test_search_foods_falls_back_from_foundation_to_branded(self):
+        session = mock.Mock()
+        with mock.patch.object(fdc, "emit_notice") as mocked_notice:
+            with mock.patch.object(fdc, "get_json_with_retries") as mocked_get:
+                mocked_get.side_effect = [
+                    {"totalPages": 1, "foods": []},
+                    {"totalPages": 1, "foods": []},
+                    {"totalPages": 1, "foods": []},
+                    {"totalPages": 1, "foods": [{"description": "Branded Raisin Bran"}]},
+                ]
+
+                foods = fdc.search_foods(
+                    session=session,
+                    food_description="raisin bran cereal",
+                    search_category="Foundation",
+                    brand_owner=None,
+                    fdc_api_key="SECRET",
+                    headers={"Accept": "application/json"},
+                    logger=self.logger,
+                )
+
+        self.assertEqual([f["description"] for f in foods], ["Branded Raisin Bran"])
+        self.assertEqual(mocked_get.call_count, 4)
+        categories = [call.kwargs["params"]["dataType"] for call in mocked_get.call_args_list]
+        self.assertEqual(categories, ["Foundation", "Foundation", "Foundation", "Branded"])
+        self.assertGreaterEqual(mocked_notice.call_count, 1)
 
 
 if __name__ == "__main__":
